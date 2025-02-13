@@ -14,13 +14,13 @@ export const candidateWords = sqliteTable("candidate_words", {
   word: text("word").notNull(),
 });
 
-export const conditionalGuesses = sqliteTable(
-  "conditional_guesses",
+export const bestGuesses = sqliteTable(
+  "best_guesses",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    currentRound: integer("current_round").notNull(),
-    previousGuess: text("previous_guess").notNull(),
-    feedback: text("feedback").notNull(),
+    round: integer("round").notNull(),
+    previousGuess: text("previous_guess"),
+    feedback: text("feedback"),
     bestGuess: text("best_guess").notNull(),
     expectedMoves: real("expected_moves").notNull(),
     candidateWords: text("candidate_words").notNull(),
@@ -28,10 +28,11 @@ export const conditionalGuesses = sqliteTable(
   },
   (table) => [
     index("idx_lookup").on(
-      table.currentRound,
+      table.round,
       table.previousGuess,
       table.feedback,
       table.candidateHash
     ),
+    index("idx_round_guess").on(table.round, table.previousGuess),
   ]
 );

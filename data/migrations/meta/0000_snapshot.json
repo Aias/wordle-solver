@@ -1,35 +1,11 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "98b674da-37d8-4132-a273-92f329aaf54e",
+  "id": "88c531c4-2660-4340-bb4a-d86e128dcb14",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
-    "candidate_words": {
-      "name": "candidate_words",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "integer",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": true
-        },
-        "word": {
-          "name": "word",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "conditional_guesses": {
-      "name": "conditional_guesses",
+    "best_guesses": {
+      "name": "best_guesses",
       "columns": {
         "id": {
           "name": "id",
@@ -49,14 +25,14 @@
           "name": "previous_guess",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
+          "notNull": false,
           "autoincrement": false
         },
         "feedback": {
           "name": "feedback",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
+          "notNull": false,
           "autoincrement": false
         },
         "best_guess": {
@@ -73,23 +49,39 @@
           "notNull": true,
           "autoincrement": false
         },
-        "all_possibilities": {
-          "name": "all_possibilities",
+        "candidate_words": {
+          "name": "candidate_words",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "candidate_hash": {
+          "name": "candidate_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
-        "conditional_guesses_round_previous_guess_feedback_unique": {
-          "name": "conditional_guesses_round_previous_guess_feedback_unique",
+        "idx_lookup": {
+          "name": "idx_lookup",
           "columns": [
             "round",
             "previous_guess",
-            "feedback"
+            "feedback",
+            "candidate_hash"
           ],
-          "isUnique": true
+          "isUnique": false
+        },
+        "idx_round_guess": {
+          "name": "idx_round_guess",
+          "columns": [
+            "round",
+            "previous_guess"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -97,18 +89,18 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "round1": {
-      "name": "round1",
+    "candidate_words": {
+      "name": "candidate_words",
       "columns": {
         "id": {
           "name": "id",
           "type": "integer",
           "primaryKey": true,
           "notNull": true,
-          "autoincrement": false
+          "autoincrement": true
         },
-        "best_guess": {
-          "name": "best_guess",
+        "word": {
+          "name": "word",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

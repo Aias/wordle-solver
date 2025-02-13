@@ -1,28 +1,27 @@
 import { db } from "./db";
-import { candidateWords, conditionalGuesses } from "./schema";
+import { candidateWords, bestGuesses } from "./schema";
 
 (async () => {
   await db.delete(candidateWords);
-  await db.delete(conditionalGuesses);
+  await db.delete(bestGuesses);
 
   const words = await Bun.file("./data/words.txt").text();
   const wordArray = words
     .split("\n")
-    .flatMap((word) => word.trim().split(" "))
+    .flatMap((word) => word.toUpperCase().trim().split(" "))
     .filter((word) => word.length === 5);
 
   for (const word of wordArray) {
-    await db.insert(candidateWords).values({ word: word.toUpperCase() });
+    await db.insert(candidateWords).values({ word });
     console.log(`Inserted ${word}`);
   }
 
-  await db.insert(conditionalGuesses).values({
-    currentRound: 1,
-    previousGuess: "TRACE",
-    feedback: "00000",
+  await db.insert(bestGuesses).values({
+    round: 1,
+    previousGuess: null,
+    feedback: null,
     bestGuess: "TRACE",
-    expectedMoves: 0,
-    candidateWords: "TRACE",
-    candidateHash: "TRACE",
+    expectedMoves: 6,
+    candidateWords: wordArray.join(","),
   });
 })();
