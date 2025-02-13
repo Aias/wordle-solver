@@ -1,6 +1,7 @@
 # Project-specific
 
 data/sqlite.db
+data/sqlite.db-journal
 
 # Based on https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore
 

@@ -1,117 +1,106 @@
-import { db, candidateWords, bestGuesses } from "../data";
-import { asc } from "drizzle-orm";
+import { db } from "./db";
+import { candidateWords, bestGuesses } from "./schema";
+import { and, asc, eq } from "drizzle-orm";
 import { createHash } from "crypto";
+import { sql } from "drizzle-orm";
 
+// Maximum rounds in Wordle.
 const MAX_ROUNDS = 6;
+// In our base‑3 encoding, "22222" equals 242.
+const CORRECT_CODE = 242;
+
+/* ========================================================
+   1. Feedback Functions & Precomputed Matrix
+======================================================== */
 
 /**
- * Represents the result of a recursive expected-moves computation:
- *  - bestGuess: chosen word that minimizes expected moves
- *  - expectedMoves: the computed expected (average) number of moves for that guess
+ * Computes the Wordle feedback for a guess vs. solution as a base‑3 numeric code.
+ * Each of the 5 positions becomes a digit:
+ *  - 2 for green,
+ *  - 1 for yellow,
+ *  - 0 for gray.
  */
-interface GuessResult {
-  bestGuess: string;
-  expectedMoves: number;
-}
-
-/**
- * Progress tracker for logging and pruning
- */
-interface ProgressTracker {
-  expansions: number;
-  expansionsLogInterval: number;
-  bestSoFar: number; // best (lowest) expected moves found so far
-}
-
-/* ======================================================================
-   1. Feedback & Candidate Filtering
-   ====================================================================== */
-
-/**
- * Compute Wordle-style feedback for (guess, solution).
- * Returns a 5-char string with '2'=green, '1'=yellow, '0'=gray.
- */
-function getFeedback(guess: string, solution: string): string {
-  const feedback = Array(5).fill("");
-  const chars = solution.split("");
-
-  // Mark greens
+function getFeedbackCode(guess: string, solution: string): number {
+  const digits = new Array(5).fill(0);
+  const solArr = solution.split("");
+  // First pass: mark greens.
   for (let i = 0; i < 5; i++) {
     if (guess[i] === solution[i]) {
-      feedback[i] = "2";
-      chars[i] = ""; // used
+      digits[i] = 2;
+      solArr[i] = ""; // mark as used
     }
   }
-  // Mark yellows or grays
+  // Second pass: mark yellows.
   for (let i = 0; i < 5; i++) {
-    if (feedback[i] === "") {
-      const idx = chars.indexOf(guess[i]);
+    if (digits[i] !== 2) {
+      const idx = solArr.indexOf(guess[i]);
       if (idx !== -1) {
-        feedback[i] = "1";
-        chars[idx] = "";
-      } else {
-        feedback[i] = "0";
+        digits[i] = 1;
+        solArr[idx] = "";
       }
     }
   }
-  return feedback.join("");
+  let code = 0;
+  for (let i = 0; i < 5; i++) {
+    code = code * 3 + digits[i];
+  }
+  return code;
 }
 
 /**
- * Build a full feedback cache [guess][answer] -> feedback,
- * so we don't recalc getFeedback repeatedly.
+ * Converts a numeric feedback code to a 5‑character string (base‑3).
  */
-async function buildFeedbackCache(): Promise<
-  Record<string, Record<string, string>>
-> {
-  const cache: Record<string, Record<string, string>> = {};
-  const allRows = await db.query.candidateWords.findMany({
-    orderBy: [asc(candidateWords.word)],
-  });
-
-  // Build row of guess => row of answer => feedback
-  for (const { word: g } of allRows) {
-    cache[g] = {};
+function feedbackToString(code: number): string {
+  let s = code.toString(3);
+  while (s.length < 5) {
+    s = "0" + s;
   }
-  for (const { word: guess } of allRows) {
-    for (const { word: answer } of allRows) {
-      cache[guess][answer] = getFeedback(guess, answer);
+  return s;
+}
+
+/**
+ * Builds the full feedback matrix for all candidate word pairs.
+ */
+function buildFeedbackMatrix(words: string[]): Uint8Array {
+  const N = words.length;
+  const matrix = new Uint8Array(N * N);
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      matrix[i * N + j] = getFeedbackCode(words[i], words[j]);
     }
   }
-  return cache;
+  return matrix;
 }
 
+/* ========================================================
+   2. In‑Memory Data Structures & Helper Functions
+======================================================== */
+
 /**
- * Filter a candidate list by a particular feedback pattern.
+ * Computes the MD5 hash of the sorted candidate set (an array of numbers).
  */
-function filterCandidatesByFeedback(
-  candidates: string[],
-  guess: string,
-  fb: string,
-  feedbackCache: Record<string, Record<string, string>>
-): string[] {
-  return candidates.filter((c) => feedbackCache[guess][c] === fb);
+function candidateSetHash(candidates: number[]): string {
+  const sorted = candidates.slice().sort((a, b) => a - b);
+  const joined = sorted.join(",");
+  return createHash("md5").update(joined).digest("hex");
 }
 
-/* ======================================================================
-   2. One-Step Entropy
-   ====================================================================== */
-
 /**
- * Computes one-step Shannon entropy for 'guess' vs. the 'candidates' subset.
+ * Computes one‑step Shannon entropy for a given guess (by index) over candidateIndices.
  */
 function oneStepEntropy(
-  guess: string,
-  candidates: string[],
-  feedbackCache: Record<string, Record<string, string>>
+  guessIdx: number,
+  candidateIndices: number[],
+  feedbackMatrix: Uint8Array,
+  N: number
 ): number {
-  const freq: Record<string, number> = {};
-  for (const ans of candidates) {
-    const fb = feedbackCache[guess][ans];
-    freq[fb] = (freq[fb] || 0) + 1;
+  const freq: Record<number, number> = {};
+  for (const candIdx of candidateIndices) {
+    const code = feedbackMatrix[guessIdx * N + candIdx];
+    freq[code] = (freq[code] || 0) + 1;
   }
   let entropy = 0;
-  const total = candidates.length;
+  const total = candidateIndices.length;
   for (const count of Object.values(freq)) {
     const p = count / total;
     entropy -= p * Math.log2(p);
@@ -119,233 +108,368 @@ function oneStepEntropy(
   return entropy;
 }
 
-/* ======================================================================
-   3. Hashing for Candidate Set
-   ====================================================================== */
+/* ========================================================
+   3. Prepared Statements for SQLite Caching
+======================================================== */
+
+// Prepared statement for checking the cache.
+const selectBestGuessStmt = db
+  .select({
+    bestGuess: bestGuesses.bestGuess,
+    expectedMoves: bestGuesses.expectedMoves,
+  })
+  .from(bestGuesses)
+  .where(
+    and(
+      eq(bestGuesses.round, sql.placeholder("round")),
+      eq(bestGuesses.candidateHash, sql.placeholder("hash"))
+    )
+  )
+  .prepare();
 
 /**
- * Creates an MD5 hash of the sorted candidate set to use as a key
- * in memoization or DB caching.
+ * Checks the DB cache for a computed best guess.
  */
-function hashCandidateSet(candidates: string[]): string {
-  // Already sorted outside, but just to be sure:
-  const joined = candidates.join(",");
-  return createHash("md5").update(joined).digest("hex");
+async function checkCachedBestGuess(
+  round: number,
+  candHash: string
+): Promise<{ bestGuess: number; expectedMoves: number } | null> {
+  const result = await selectBestGuessStmt.execute({
+    round: round,
+    hash: candHash,
+  });
+  if (result && result.length > 0) {
+    const bestGuessWord = result[0].bestGuess;
+    const bestGuessIdx = wordToIndex.get(bestGuessWord);
+    if (bestGuessIdx === undefined) return null;
+    return {
+      bestGuess: bestGuessIdx,
+      expectedMoves: result[0].expectedMoves,
+    };
+  }
+  return null;
 }
 
-/* ======================================================================
-   4. Recursive Expected-Moves Computation
-   ====================================================================== */
+// Prepared statement for inserting into the cache.
+const insertBestGuessStmt = db
+  .insert(bestGuesses)
+  .values({
+    round: sql.placeholder("round"),
+    previousGuess: sql.placeholder("prevGuess"),
+    feedback: sql.placeholder("feedback"),
+    bestGuess: sql.placeholder("bestGuess"),
+    expectedMoves: sql.placeholder("expMoves"),
+    candidateWords: sql.placeholder("candWords"),
+    candidateHash: sql.placeholder("candHash"),
+  })
+  .prepare();
 
-function computeOptimalGuessRecursive(
-  candidates: string[],
-  depthLeft: number,
-  feedbackCache: Record<string, Record<string, string>>,
-  memo: Map<string, GuessResult>,
-  progress: ProgressTracker,
-  logCandidates: boolean = false
-): GuessResult {
-  // Base cases
-  if (candidates.length <= 1) {
-    return { bestGuess: candidates[0] || "", expectedMoves: 0 };
+/**
+ * Stores a computed best guess in the DB.
+ * For round=2, we now pass the actual previous guess and feedback.
+ * For deeper recursion, we leave them empty by design.
+ */
+async function storeBestGuessInDB(
+  round: number,
+  candHash: string,
+  candidateIndices: number[],
+  bestGuessIdx: number,
+  expectedMoves: number,
+  previousGuess: string = "",
+  feedback: string = ""
+): Promise<void> {
+  if (bestGuessIdx < 0 || bestGuessIdx >= words.length) {
+    console.error(`[ERROR] Invalid bestGuessIdx: ${bestGuessIdx}`);
+    return;
   }
-  if (depthLeft === 0) {
-    // Fallback: best one-step entropy
-    let fallbackBest = "";
-    let fallbackCost = Infinity;
-    const maxEnt = Math.log2(candidates.length);
-    for (const guess of candidates) {
-      const ent = oneStepEntropy(guess, candidates, feedbackCache);
-      const cost = 1 + (maxEnt - ent);
-      if (cost < fallbackCost) {
-        fallbackCost = cost;
-        fallbackBest = guess;
-      }
+  const candidateWordsArr = candidateIndices
+    .slice()
+    .sort((a, b) => a - b)
+    .map((idx) => words[idx]);
+  try {
+    await insertBestGuessStmt.execute({
+      round: round,
+      prevGuess: previousGuess,
+      feedback: feedback,
+      bestGuess: words[bestGuessIdx],
+      expMoves: expectedMoves,
+      candWords: candidateWordsArr.join(","),
+      candHash: candHash,
+    });
+  } catch (error) {
+    console.error(`[ERROR] Failed to store best guess in DB:`, {
+      round,
+      previousGuess,
+      feedback,
+      bestGuess: words[bestGuessIdx],
+      expectedMoves,
+      candidateCount: candidateWordsArr.length,
+      error,
+    });
+    throw error;
+  }
+}
+
+/* ========================================================
+   4. Global Variables (Filled in runPrecomputation)
+======================================================== */
+
+let words: string[] = []; // Candidate words array (from round 1)
+const wordToIndex = new Map<string, number>(); // word -> index mapping
+let feedbackMatrix: Uint8Array; // Precomputed feedback matrix
+let N = 0; // Number of candidate words
+
+/* ========================================================
+   5. Recursive Expected‑Moves Computation with Alpha–Beta Pruning
+======================================================== */
+
+/**
+ * In‑memory memoization cache.
+ * Key: `${depthLeft}:${candidateSetHash}`
+ */
+const memo = new Map<string, { bestGuess: number; expectedMoves: number }>();
+
+/**
+ * Recursively computes the best guess for the candidate set.
+ *
+ * @param candidateIndices Array of candidate word indices.
+ * @param depthLeft Number of guesses remaining (6 is round 1, 5 is round 2, etc.).
+ * @param alpha Current best (lowest) worst‑case cost for pruning.
+ * @param prevGuess For round=2 calls, the prior guess (e.g. "TRACE"), else "".
+ * @param feedback For round=2 calls, the feedback code from guess (e.g. "00220"), else "".
+ */
+async function computeOptimalGuessRecursive(
+  candidateIndices: number[],
+  depthLeft: number,
+  alpha: number,
+  prevGuess: string,
+  feedback: string
+): Promise<{ bestGuess: number; expectedMoves: number }> {
+  // Base checks
+  if (candidateIndices.length === 0) {
+    throw new Error("Empty candidate set");
+  }
+
+  // Determine the "round" from depthLeft.
+  // For Wordle: round = MAX_ROUNDS - depthLeft + 1
+  const currentRound = MAX_ROUNDS - depthLeft + 1;
+  // Create a stable key for memo + DB.
+  candidateIndices.sort((a, b) => a - b);
+  const candHash = candidateSetHash(candidateIndices);
+  const memoKey = `${depthLeft}:${candHash}`;
+
+  // If there's exactly one candidate, we know the best guess is that candidate, expected 0 more moves.
+  // We do want to store this in the DB (if not cached) to ensure round=2 metadata is recorded properly.
+  if (candidateIndices.length === 1) {
+    // Check memo or DB
+    if (memo.has(memoKey)) {
+      return memo.get(memoKey)!;
     }
-    return { bestGuess: fallbackBest, expectedMoves: fallbackCost };
+    const cached = await checkCachedBestGuess(currentRound, candHash);
+    if (cached) {
+      memo.set(memoKey, cached);
+      return cached;
+    }
+    // Store for the base case
+    const singleBest = {
+      bestGuess: candidateIndices[0],
+      expectedMoves: 0,
+    };
+    memo.set(memoKey, singleBest);
+    // If round=2, store real previousGuess/feedback; otherwise blank
+    const storePrevGuess = currentRound === 2 ? prevGuess : "";
+    const storeFeedback = currentRound === 2 ? feedback : "";
+    await storeBestGuessInDB(
+      currentRound,
+      candHash,
+      candidateIndices,
+      singleBest.bestGuess,
+      singleBest.expectedMoves,
+      storePrevGuess,
+      storeFeedback
+    );
+    return singleBest;
   }
 
   // Check memo
-  const hash = hashCandidateSet(candidates);
-  const memoKey = `${depthLeft}:${hash}`;
   if (memo.has(memoKey)) {
     return memo.get(memoKey)!;
   }
-
-  // Log expansions
-  progress.expansions++;
-  if (progress.expansions % progress.expansionsLogInterval === 0) {
-    console.log(
-      `[INFO] expansions=${progress.expansions}, depthLeft=${depthLeft}, setSize=${candidates.length}`
-    );
+  // Check DB cache
+  const cached = await checkCachedBestGuess(currentRound, candHash);
+  if (cached) {
+    memo.set(memoKey, cached);
+    return cached;
   }
 
-  // Sort guesses by descending one-step entropy
-  const guessOrder = candidates.slice();
-  guessOrder.sort(
+  // Fallback: initialize with first candidate (just to have some valid baseline).
+  let localBest = {
+    bestGuess: candidateIndices[0],
+    expectedMoves: Infinity,
+  };
+
+  // Sort guesses by descending one‑step entropy to prioritize high-entropy guesses first.
+  const guessList = candidateIndices.slice();
+  guessList.sort(
     (a, b) =>
-      oneStepEntropy(b, candidates, feedbackCache) -
-      oneStepEntropy(a, candidates, feedbackCache)
+      oneStepEntropy(b, candidateIndices, feedbackMatrix, N) -
+      oneStepEntropy(a, candidateIndices, feedbackMatrix, N)
   );
-  if (logCandidates) {
-    console.log(`[INFO] Candidates: ${guessOrder.join(",")}`);
-  }
 
-  let localBest: GuessResult = { bestGuess: "", expectedMoves: Infinity };
-
-  for (const guess of guessOrder) {
-    // Partition into feedback groups
-    const partitions: Record<string, string[]> = {};
-    for (const ans of candidates) {
-      const fb = feedbackCache[guess][ans];
-      if (!partitions[fb]) partitions[fb] = [];
-      partitions[fb].push(ans);
+  // Search all possible guesses among the candidate set
+  for (const guessIdx of guessList) {
+    // Partition candidate set by feedback outcome for guessIdx.
+    const partitions = new Map<number, number[]>();
+    for (const secretIdx of candidateIndices) {
+      const fbCode = feedbackMatrix[guessIdx * N + secretIdx];
+      if (!partitions.has(fbCode)) {
+        partitions.set(fbCode, []);
+      }
+      partitions.get(fbCode)!.push(secretIdx);
     }
 
-    let expMoves = 1; // current guess
-    for (const group of Object.values(partitions)) {
-      const prob = group.length / candidates.length;
-      if (group.length > 1) {
-        const subRes = computeOptimalGuessRecursive(
-          group,
+    let expMoves = 1; // cost for using the current guess
+    for (const subset of partitions.values()) {
+      const prob = subset.length / candidateIndices.length;
+      if (subset.length > 1) {
+        const subRes = await computeOptimalGuessRecursive(
+          subset,
           depthLeft - 1,
-          feedbackCache,
-          memo,
-          progress
+          Math.min(alpha, localBest.expectedMoves),
+          "", // deeper recursion => no "previousGuess"
+          "" // deeper recursion => no "feedback"
         );
         expMoves += prob * subRes.expectedMoves;
+      } else {
+        // If subset.length === 1, no further moves needed for that subset
+        expMoves += prob * 0;
       }
-      // Early partial sum check
-      if (expMoves >= localBest.expectedMoves) {
+      // Alpha–beta pruning check
+      if (expMoves >= localBest.expectedMoves || expMoves >= alpha) {
         expMoves = Infinity;
         break;
       }
     }
 
-    // Prune if we can't improve the top-level bestSoFar
-    if (expMoves >= progress.bestSoFar) {
-      continue;
-    }
-
+    // Update local best
     if (expMoves < localBest.expectedMoves) {
-      localBest = { bestGuess: guess, expectedMoves: expMoves };
-      // If near 1.0, bail out
-      if (localBest.expectedMoves <= 1.00001) {
-        break;
-      }
+      localBest = { bestGuess: guessIdx, expectedMoves: expMoves };
+      // If we've found an extremely good guess, we can short-circuit.
+      if (localBest.expectedMoves <= 1.00001) break;
     }
   }
 
   memo.set(memoKey, localBest);
 
-  // Update global bestSoFar if this is top-level
-  if (
-    depthLeft === MAX_ROUNDS &&
-    localBest.expectedMoves < progress.bestSoFar
-  ) {
-    progress.bestSoFar = localBest.expectedMoves;
-  }
+  // Store the best guess in DB.
+  // For round=2, store real previousGuess/feedback; for deeper recursion, store blank.
+  const storePrevGuess = currentRound === 2 ? prevGuess : "";
+  const storeFeedback = currentRound === 2 ? feedback : "";
+  await storeBestGuessInDB(
+    currentRound,
+    candHash,
+    candidateIndices,
+    localBest.bestGuess,
+    localBest.expectedMoves,
+    storePrevGuess,
+    storeFeedback
+  );
 
+  // If no finite solution found, warn
+  if (localBest.expectedMoves === Infinity) {
+    console.warn(
+      `Warning: No finite solution for ${
+        candidateIndices.length
+      } candidates; fallback guess=${words[localBest.bestGuess]}`
+    );
+  }
   return localBest;
 }
 
-/* ======================================================================
-   5. Round 2 Precomputation:
-      - We assume we have a row in bestGuesses for round=1 with bestGuess="TRACE"
-      - That row has candidateWords = the entire corpus
-      - We'll partition that set by possible feedback strings for "TRACE",
-        then compute the best guess among each partition, storing round=2 results
-   ====================================================================== */
+/* ========================================================
+   6. Round 2 Precomputation: Partitioning by First Guess Feedback
+======================================================== */
 
+/**
+ * Main routine for precomputing round‑2 best guesses.
+ * Assumes a round‑1 best guess of "TRACE" (or whatever is in the DB for round=1).
+ */
 export async function runPrecomputation() {
-  // 1) Look up the row for round=1. We expect bestGuess="TRACE" and a full candidate list.
+  // Retrieve round‑1 row from the DB.
   const round1Row = await db.query.bestGuesses.findFirst({
     where: (table, { eq }) => eq(table.round, 1),
   });
-  if (!round1Row) {
+  if (!round1Row || !round1Row.bestGuess) {
     console.error(
-      "[ERROR] No round=1 row found in best_guesses. Please insert one first."
+      "[ERROR] Round=1 row not found or missing bestGuess. Insert one first (e.g. bestGuess='TRACE')."
     );
     return;
   }
-
-  const { bestGuess: firstGuess, candidateWords: allCandidatesStr } = round1Row;
-  if (!firstGuess) {
-    console.error("[ERROR] Round=1 row is missing bestGuess. Aborting.");
-    return;
-  }
-
+  const firstGuess = round1Row.bestGuess;
   console.log(`[INFO] Found round=1 row. bestGuess=${firstGuess}`);
-  const allCandidates = allCandidatesStr.split(",").sort();
-  console.log(`[INFO] Full candidate set size=${allCandidates.length}.`);
 
-  // 2) Build the feedback cache (once)
-  console.log("[INFO] Building feedback cache...");
-  const feedbackCache = await buildFeedbackCache();
-  console.log("[INFO] Feedback cache built.");
+  // Parse full candidate set from round‑1.
+  const candidateWordsStr = round1Row.candidateWords;
+  const candidateWordsArr = candidateWordsStr
+    .split(",")
+    .map((w) => w.trim())
+    .filter(Boolean);
+  candidateWordsArr.sort();
+  words = candidateWordsArr;
+  N = words.length;
+  words.forEach((w, i) => wordToIndex.set(w, i));
+  console.log(`[INFO] Full candidate set size=${N}.`);
 
-  // 3) Partition the entire set by the feedback they'd produce for firstGuess.
-  const feedbackGroups: Record<string, string[]> = {};
-  for (const candidate of allCandidates) {
-    const fb = feedbackCache[firstGuess][candidate];
-    if (!feedbackGroups[fb]) feedbackGroups[fb] = [];
-    feedbackGroups[fb].push(candidate);
+  // Build feedback matrix for all words.
+  console.log("[INFO] Building feedback matrix...");
+  feedbackMatrix = buildFeedbackMatrix(words);
+  console.log("[INFO] Feedback matrix built.");
+
+  // Partition candidates by feedback from the first guess, e.g. "TRACE".
+  const firstGuessIdx = wordToIndex.get(firstGuess);
+  if (firstGuessIdx === undefined) {
+    console.error(
+      `[ERROR] First guess "${firstGuess}" not found in candidate set.`
+    );
+    return;
   }
-
-  // 4) For each feedback pattern, run a recursive search on that subset and store round=2 in DB
-  const memo = new Map<string, GuessResult>();
-  const progress: ProgressTracker = {
-    expansions: 0,
-    expansionsLogInterval: 1000,
-    bestSoFar: Infinity,
-  };
-  const depthLeft = MAX_ROUNDS - 1; // we've used 1 guess, so 5 remain
-
-  for (const [fb, group] of Object.entries(feedbackGroups)) {
-    // If group.length <= 1, trivial
-    if (group.length <= 1) {
-      const best = group[0] || firstGuess;
-      console.log(
-        `[INFO] Feedback=${fb} => only ${group.length} candidate => best guess=${best}`
-      );
-      await db.insert(bestGuesses).values({
-        round: 2,
-        previousGuess: firstGuess,
-        feedback: fb,
-        bestGuess: best,
-        expectedMoves: 0,
-        candidateWords: group.join(","),
-      });
-      continue;
+  const feedbackGroups = new Map<number, number[]>();
+  for (let idx = 0; idx < N; idx++) {
+    const fbCode = feedbackMatrix[firstGuessIdx * N + idx];
+    if (!feedbackGroups.has(fbCode)) {
+      feedbackGroups.set(fbCode, []);
     }
-    console.log(
-      `[INFO] Feedback=${fb}, group size=${group.length}. Computing optimal guess...`
-    );
-    const result = computeOptimalGuessRecursive(
-      group,
-      depthLeft,
-      feedbackCache,
-      memo,
-      progress
-    );
-    console.log(
-      `[INFO] => best guess=${
-        result.bestGuess
-      }, expected moves=${result.expectedMoves.toFixed(3)}, expansions so far=${
-        progress.expansions
-      }`
-    );
-
-    // Store in DB
-    await db.insert(bestGuesses).values({
-      round: 2,
-      previousGuess: firstGuess,
-      feedback: fb,
-      bestGuess: result.bestGuess,
-      expectedMoves: result.expectedMoves,
-      candidateWords: group.join(","),
-    });
+    feedbackGroups.get(fbCode)!.push(idx);
   }
 
-  console.log("[INFO] Precomputation for round=2 complete!");
+  // Now compute the best guess for round=2 in each feedback partition.
+  // round=2 => depthLeft=5 (since 6 guesses max, we used 1 guess already).
+  const depthLeft = MAX_ROUNDS - 1;
+
+  for (const [fbCode, group] of feedbackGroups.entries()) {
+    const groupSorted = group.slice().sort((a, b) => a - b);
+    // For logging
+    console.log(
+      `[INFO] Round=2, feedback=${feedbackToString(fbCode)}, group size=${
+        groupSorted.length
+      }. Computing optimal guess...`
+    );
+
+    // Compute best guess for this subset with recursion.
+    const result = await computeOptimalGuessRecursive(
+      groupSorted,
+      depthLeft,
+      Infinity,
+      firstGuess,
+      feedbackToString(fbCode)
+    );
+
+    console.log(
+      `[INFO] Feedback=${feedbackToString(fbCode)} => best guess=${
+        words[result.bestGuess]
+      } (expected moves=${result.expectedMoves.toFixed(3)})`
+    );
+  }
+
+  console.log("[INFO] Precomputation for round 2 complete!");
 }

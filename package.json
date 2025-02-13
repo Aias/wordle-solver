@@ -14,8 +14,9 @@
   },
   "scripts": {
     "precompute": "bun run src/index.ts",
-    "seed": "bun run data/seed.ts",
+    "seed": "bun run src/seed.ts",
     "generate": "bun drizzle-kit generate",
-    "migrate": "bun run data/migrate.ts"
+    "migrate": "bun run src/migrate.ts",
+    "code": "code2prompt ./src"
   }
 }
