@@ -1,10 +1,10 @@
 import { db } from "./db";
-import { candidateWords, round1, round2 } from "./schema";
+import { candidateWords, round1, conditionalGuesses } from "./schema";
 
 (async () => {
   await db.delete(candidateWords);
   await db.delete(round1);
-  await db.delete(round2);
+  await db.delete(conditionalGuesses);
 
   const words = await Bun.file("./data/words.txt").text();
   const wordArray = words
@@ -12,10 +12,10 @@ import { candidateWords, round1, round2 } from "./schema";
     .flatMap((word) => word.trim().split(" "))
     .filter((word) => word.length === 5);
 
-  wordArray.forEach(async (word) => {
+  for (const word of wordArray) {
     await db.insert(candidateWords).values({ word: word.toUpperCase() });
     console.log(`Inserted ${word}`);
-  });
+  }
 
   await db.insert(round1).values({
     bestGuess: "TRACE",

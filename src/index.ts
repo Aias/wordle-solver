@@ -1,6 +1,6 @@
-import { db, round2 } from "../data";
+import { db, conditionalGuesses } from "../data";
 import { runPrecomputation } from "./precompute";
 
-await db.delete(round2);
+await db.delete(conditionalGuesses);
 
 runPrecomputation();

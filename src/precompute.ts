@@ -1,5 +1,5 @@
-import { db, candidateWords, round1, round2 } from "../data";
-import { eq } from "drizzle-orm";
+import { db, candidateWords, round1, conditionalGuesses } from "../data";
+import { asc } from "drizzle-orm";
 
 const MAX_ROUNDS = 6;
 
@@ -64,20 +64,20 @@ function getFeedback(guess: string, solution: string): string {
  * Build a 2D feedback cache to avoid recomputing getFeedback many times.
  * feedbackCache[guess][answer] = feedbackString
  */
-function buildFeedbackCache(
-  candidates: string[]
-): Record<string, Record<string, string>> {
-  const feedbackCache: Record<string, Record<string, string>> = {};
-
-  for (const g of candidates) {
-    feedbackCache[g] = {};
-  }
-  for (const guess of candidates) {
-    for (const answer of candidates) {
-      feedbackCache[guess][answer] = getFeedback(guess, answer);
+async function buildFeedbackCache(): Promise<
+  Record<string, Record<string, string>>
+> {
+  const cache: Record<string, Record<string, string>> = {};
+  const fullCandidates = await db.query.candidateWords.findMany({
+    orderBy: [asc(candidateWords.word)],
+  });
+  for (const { word: guess } of fullCandidates) {
+    cache[guess] = {};
+    for (const { word: answer } of fullCandidates) {
+      cache[guess][answer] = getFeedback(guess, answer);
     }
   }
-  return feedbackCache;
+  return cache;
 }
 
 //
@@ -240,11 +240,12 @@ export async function precomputeBestFirstGuess(useRecursive = false) {
   // Single sort of candidate set
   const candidates = candidateRows.map((row) => row.word).sort();
 
+  const feedbackCache = await buildFeedbackCache();
+
   let bestFirstGuess = "";
   if (!useRecursive) {
     // Use simple one-step entropy
     console.log("[INFO] Building feedback cache for one-step entropy...");
-    const feedbackCache = buildFeedbackCache(candidates);
 
     let bestEntropy = -Infinity;
     for (const g of candidates) {
@@ -276,7 +277,6 @@ export async function precomputeBestFirstGuess(useRecursive = false) {
       `[INFO] Full recursion with depth=6 on ${candidates.length} candidates.`
     );
     console.log("[INFO] Building complete feedback cache...");
-    const feedbackCache = buildFeedbackCache(candidates);
 
     const memo = new Map<string, GuessResult>();
     const progress: ProgressTracker = {
@@ -312,17 +312,20 @@ export async function precomputeBestFirstGuess(useRecursive = false) {
  * For each possible feedback pattern from the best first guess, compute the
  * optimal second guess using recursion with depth=5.
  */
-export async function precomputeBestSecondGuesses(bestFirstGuess: string) {
-  const candidateRows = await db.select().from(candidateWords);
-  const candidates = candidateRows.map((row) => row.word).sort();
+export async function computeConditionalGuesses(
+  previousGuess: string,
+  round: number,
+  remainingCandidates: string[]
+) {
+  const candidates = remainingCandidates.slice().sort();
 
   console.log(`[INFO] Building feedback cache for second-guess computation...`);
-  const feedbackCache = buildFeedbackCache(candidates);
+  const feedbackCache = await buildFeedbackCache();
 
   // Partition all candidates by the feedback they'd produce if the bestFirstGuess were used
   const feedbackGroups: Record<string, string[]> = {};
   for (const answer of candidates) {
-    const fb = feedbackCache[bestFirstGuess][answer];
+    const fb = feedbackCache[previousGuess][answer];
     if (!feedbackGroups[fb]) feedbackGroups[fb] = [];
     feedbackGroups[fb].push(answer);
   }
@@ -340,15 +343,17 @@ export async function precomputeBestSecondGuesses(bestFirstGuess: string) {
   for (const [fb, group] of Object.entries(feedbackGroups)) {
     if (group.length <= 1) {
       // If only one or zero candidates remain, that guess is trivially correct.
-      const bestSecond = group[0] || bestFirstGuess;
+      const bestSecond = group[0] || previousGuess;
       console.log(
         `[INFO] Feedback ${fb}: only one candidate, so bestSecond=${bestSecond}`
       );
-      await db.insert(round2).values({
+      await db.insert(conditionalGuesses).values({
+        round,
+        previousGuess,
         feedback: fb,
         bestGuess: bestSecond,
-        possibilities: group.join(","),
         expectedMoves: 0,
+        allPossibilities: group.join(","),
       });
       continue;
     }
@@ -369,29 +374,25 @@ export async function precomputeBestSecondGuesses(bestFirstGuess: string) {
         progress.expansions
       })`
     );
-    await db.insert(round2).values({
+    await db.insert(conditionalGuesses).values({
+      round,
+      previousGuess,
       feedback: fb,
       bestGuess: result.guess,
-      possibilities: group.join(","),
       expectedMoves: result.moves,
+      allPossibilities: candidates.join(","),
     });
   }
 }
 
-/**
- * Demonstration runner
- */
-export async function runPrecomputation(overwrite = false) {
-  let round1Word = await db.query.round1.findFirst();
-  if (!round1Word || overwrite) {
-    // 1) Compute best first guess with full recursion or not
-    round1Word = await precomputeBestFirstGuess(true);
+export async function runPrecomputation() {
+  const allCandidates = await db.query.candidateWords.findMany({
+    orderBy: [asc(candidateWords.word)],
+  });
+  const allWords = allCandidates.map((row) => row.word);
+  for (const word of allWords) {
+    console.log(`[INFO] Computing conditional guesses for ${word}...`);
+    const remainingCandidates = allWords.filter((w) => w !== word);
+    await computeConditionalGuesses(word, 2, remainingCandidates);
   }
-
-  const bestFirst = round1Word.bestGuess;
-  console.log(`[INFO] Using best first guess: ${bestFirst}`);
-
-  // 3) Precompute best second guesses
-  console.log("Precomputing best second guesses...");
-  await precomputeBestSecondGuesses(bestFirst);
 }

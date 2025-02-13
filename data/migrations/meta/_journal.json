@@ -15,6 +15,20 @@
       "when": 1739462130611,
       "tag": "0001_ancient_silverclaw",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1739463013835,
+      "tag": "0002_high_xorn",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1739464799175,
+      "tag": "0003_brainy_talos",
+      "breakpoints": true
     }
   ]
 }

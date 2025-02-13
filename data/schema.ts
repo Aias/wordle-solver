@@ -1,4 +1,10 @@
-import { sqliteTable, integer, text, real } from "drizzle-orm/sqlite-core";
+import {
+  sqliteTable,
+  integer,
+  text,
+  real,
+  unique,
+} from "drizzle-orm/sqlite-core";
 
 /**
  * Table for storing the valid candidate words.
@@ -17,14 +23,16 @@ export const round1 = sqliteTable("round1", {
   bestGuess: text("best_guess").notNull(),
 });
 
-/**
- * Table for storing the mapping from a feedback pattern to the optimal second guess.
- * The feedback pattern is stored as a string (e.g. "01210"), where:
- *   0 = gray, 1 = yellow, 2 = green.
- */
-export const round2 = sqliteTable("round2", {
-  feedback: text("feedback").primaryKey(),
-  bestGuess: text("best_guess").notNull(),
-  possibilities: text("possibilities").notNull(),
-  expectedMoves: real("expected_moves").notNull(),
-});
+export const conditionalGuesses = sqliteTable(
+  "conditional_guesses",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    round: integer("round").notNull(),
+    previousGuess: text("previous_guess").notNull(),
+    feedback: text("feedback").notNull(),
+    bestGuess: text("best_guess").notNull(),
+    expectedMoves: real("expected_moves").notNull(),
+    allPossibilities: text("all_possibilities").notNull(),
+  },
+  (table) => [unique().on(table.round, table.previousGuess, table.feedback)]
+);

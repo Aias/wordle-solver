@@ -11,5 +11,11 @@
   },
   "dependencies": {
     "drizzle-orm": "^0.39.3"
+  },
+  "scripts": {
+    "precompute": "bun run src/index.ts",
+    "seed": "bun run data/seed.ts",
+    "generate": "bun drizzle-kit generate",
+    "migrate": "bun run data/migrate.ts"
   }
 }
