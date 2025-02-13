@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "5790f9b7-4b14-4f10-b974-35752e85bbbf",
-  "prevId": "93ba8a8b-3125-465d-aace-d387127ef666",
+  "id": "97a035f9-ab2a-43e7-b65b-db04259ddb39",
+  "prevId": "98b674da-37d8-4132-a273-92f329aaf54e",
   "tables": {
     "candidate_words": {
       "name": "candidate_words",
@@ -28,49 +28,39 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "round1": {
-      "name": "round1",
+    "conditional_guesses": {
+      "name": "conditional_guesses",
       "columns": {
         "id": {
           "name": "id",
           "type": "integer",
           "primaryKey": true,
           "notNull": true,
+          "autoincrement": true
+        },
+        "current_round": {
+          "name": "current_round",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
           "autoincrement": false
         },
-        "best_guess": {
-          "name": "best_guess",
+        "previous_guess": {
+          "name": "previous_guess",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "round2": {
-      "name": "round2",
-      "columns": {
+        },
         "feedback": {
           "name": "feedback",
           "type": "text",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
         "best_guess": {
           "name": "best_guess",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "possibilities": {
-          "name": "possibilities",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
@@ -82,9 +72,34 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "candidate_words": {
+          "name": "candidate_words",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "candidate_hash": {
+          "name": "candidate_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "idx_lookup": {
+          "name": "idx_lookup",
+          "columns": [
+            "current_round",
+            "previous_guess",
+            "feedback",
+            "candidate_hash"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
@@ -96,7 +111,10 @@
   "_meta": {
     "schemas": {},
     "tables": {},
-    "columns": {}
+    "columns": {
+      "\"conditional_guesses\".\"round\"": "\"conditional_guesses\".\"current_round\"",
+      "\"conditional_guesses\".\"all_possibilities\"": "\"conditional_guesses\".\"candidate_words\""
+    }
   },
   "internal": {
     "indexes": {}

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "93ba8a8b-3125-465d-aace-d387127ef666",
+  "id": "98b674da-37d8-4132-a273-92f329aaf54e",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "candidate_words": {
@@ -28,13 +28,34 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "round1": {
-      "name": "round1",
+    "conditional_guesses": {
+      "name": "conditional_guesses",
       "columns": {
         "id": {
           "name": "id",
           "type": "integer",
           "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "round": {
+          "name": "round",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "previous_guess": {
+          "name": "previous_guess",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "feedback": {
+          "name": "feedback",
+          "type": "text",
+          "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
@@ -44,20 +65,44 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "expected_moves": {
+          "name": "expected_moves",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "all_possibilities": {
+          "name": "all_possibilities",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "conditional_guesses_round_previous_guess_feedback_unique": {
+          "name": "conditional_guesses_round_previous_guess_feedback_unique",
+          "columns": [
+            "round",
+            "previous_guess",
+            "feedback"
+          ],
+          "isUnique": true
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "round2": {
-      "name": "round2",
+    "round1": {
+      "name": "round1",
       "columns": {
-        "feedback": {
-          "name": "feedback",
-          "type": "text",
+        "id": {
+          "name": "id",
+          "type": "integer",
           "primaryKey": true,
           "notNull": true,
           "autoincrement": false

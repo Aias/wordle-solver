@@ -1,12 +1,12 @@
-import { db, candidateWords, round1, conditionalGuesses } from "../data";
+import { db, candidateWords, conditionalGuesses } from "../data";
 import { asc } from "drizzle-orm";
 
 const MAX_ROUNDS = 6;
 
 /**
- * A simple interface to store the result of a recursive computation:
- * - guess: the word that yields the minimal expected moves
- * - moves: the expected moves value for that guess
+ * Represents the result of a recursive expected-moves computation:
+ *  - guess: the chosen word that minimizes the expected number of moves
+ *  - moves: the expected (average) number of moves if that guess is chosen
  */
 interface GuessResult {
   guess: string;
@@ -14,23 +14,25 @@ interface GuessResult {
 }
 
 /**
- * A structure to track our global progress and log it periodically.
+ * Tracks progress of the recursion to provide logging and pruning:
+ *  - expansions: number of subsets we've expanded in recursion
+ *  - expansionsLogInterval: how often to log expansions
+ *  - bestSoFar: the best (lowest) expected moves found so far (used for pruning)
  */
 interface ProgressTracker {
-  expansions: number; // how many subsets we have expanded
-  expansionsLogInterval: number; // how often to log expansions
-  bestSoFar: number; // the best (lowest) expected moves found so far at the top level
+  expansions: number;
+  expansionsLogInterval: number;
+  bestSoFar: number;
 }
 
-//
-// =========================================
-// 1. Feedback Calculation + Caching
-// =========================================
-//
+/* --------------------------------------
+   1. Feedback + Candidate Filtering
+-------------------------------------- */
 
 /**
- * Computes the Wordle feedback for a given guess vs a solution.
- * Returns a 5-char string of digits (0=gray, 1=yellow, 2=green).
+ * Compute Wordle-style feedback for guess vs solution.
+ * Returns a 5-character string of digits:
+ *   '2' = green, '1' = yellow, '0' = gray
  */
 function getFeedback(guess: string, solution: string): string {
   const feedback = Array(5).fill("");
@@ -40,29 +42,43 @@ function getFeedback(guess: string, solution: string): string {
   for (let i = 0; i < 5; i++) {
     if (guess[i] === solution[i]) {
       feedback[i] = "2";
-      solutionChars[i] = ""; // used up
+      solutionChars[i] = "";
     }
   }
 
-  // Mark yellows (1) and grays (0)
+  // Mark yellows (1) or grays (0)
   for (let i = 0; i < 5; i++) {
     if (feedback[i] === "") {
       const idx = solutionChars.indexOf(guess[i]);
       if (idx !== -1) {
         feedback[i] = "1";
-        solutionChars[idx] = ""; // used up
+        solutionChars[idx] = "";
       } else {
         feedback[i] = "0";
       }
     }
   }
-
   return feedback.join("");
 }
 
 /**
- * Build a 2D feedback cache to avoid recomputing getFeedback many times.
- * feedbackCache[guess][answer] = feedbackString
+ * Filters the given candidate list down to only those words that would produce
+ * exactly the specified feedback if 'guess' was used against them.
+ */
+function filterCandidatesByFeedback(
+  candidates: string[],
+  guess: string,
+  feedback: string,
+  feedbackCache: Record<string, Record<string, string>>
+): string[] {
+  return candidates.filter((word) => {
+    return feedbackCache[guess][word] === feedback;
+  });
+}
+
+/**
+ * Builds a 2D feedback cache for all (guess, answer) pairs in the corpus.
+ * feedbackCache[guess][answer] = feedback string
  */
 async function buildFeedbackCache(): Promise<
   Record<string, Record<string, string>>
@@ -71,6 +87,7 @@ async function buildFeedbackCache(): Promise<
   const fullCandidates = await db.query.candidateWords.findMany({
     orderBy: [asc(candidateWords.word)],
   });
+
   for (const { word: guess } of fullCandidates) {
     cache[guess] = {};
     for (const { word: answer } of fullCandidates) {
@@ -80,319 +97,279 @@ async function buildFeedbackCache(): Promise<
   return cache;
 }
 
-//
-// =========================================
-// 2. Recursive Function with Pruning
-// =========================================
-//
+/* --------------------------------------
+   2. One-Step Entropy
+-------------------------------------- */
 
 /**
- * Recursively compute the guess that minimizes the expected moves to solve Wordle.
- * We keep track of expansions in a "progress" object and log periodically.
+ * Computes a quick, one-step entropy measure for 'guess' given a candidate list.
+ * This is used to sort guesses so that we explore high-entropy (likely better) guesses first.
+ */
+function oneStepEntropy(
+  guess: string,
+  candidates: string[],
+  feedbackCache: Record<string, Record<string, string>>
+): number {
+  const freq: Record<string, number> = {};
+  for (const ans of candidates) {
+    const fb = feedbackCache[guess][ans];
+    freq[fb] = (freq[fb] || 0) + 1;
+  }
+  let entropy = 0;
+  const total = candidates.length;
+  for (const count of Object.values(freq)) {
+    const p = count / total;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+/* --------------------------------------
+   3. Recursive Expected-Moves Search
+-------------------------------------- */
+
+/**
+ * Recursively compute the guess that yields minimal expected moves among 'candidates',
+ * with 'depthLeft' guesses remaining. We reorder guesses by a quick one-step entropy
+ * to find a good guess early (and prune subsequent guesses).
  *
- * If partial computations exceed `progress.bestSoFar`, we prune (i.e., abort exploring
- * that guess), as we won't do better than the best known top-level guess.
- *
- * @param candidates - sorted array of candidate words
- * @param depthLeft - how many guesses remain (including this one)
- * @param feedbackCache - precomputed feedback
- * @param memo - memo table keyed by "depth:candidates.join(',')"
- * @param progress - tracks expansions and bestSoFar for pruning
- * @returns { guess, moves }
+ * If 'depthLeft' == 0, we fallback to a single-step entropy approach rather than a deeper search.
  */
 function computeOptimalGuessRecursive(
   candidates: string[],
   depthLeft: number,
   feedbackCache: Record<string, Record<string, string>>,
   memo: Map<string, GuessResult>,
-  progress: ProgressTracker
+  progress: ProgressTracker,
+  logCandidates: boolean = true
 ): GuessResult {
-  // Base / edge cases
+  // Base cases:
   if (candidates.length <= 1) {
     return { guess: candidates[0] || "", moves: 0 };
   }
   if (depthLeft === 0) {
-    // Fallback using one-step entropy as a heuristic
+    // Fallback: pick the guess with the highest single-step entropy
     let bestGuess = "";
-    let bestFallbackCost = Infinity;
-    const maxEntropy = Math.log2(candidates.length); // maximum possible entropy for the candidate set
+    let bestFallback = Infinity;
+    const maxEnt = Math.log2(candidates.length);
 
     for (const guess of candidates) {
-      let entropy = 0;
-      const freq: Record<string, number> = {};
-      for (const answer of candidates) {
-        const fb = feedbackCache[guess][answer];
-        freq[fb] = (freq[fb] || 0) + 1;
-      }
-      for (const count of Object.values(freq)) {
-        const p = count / candidates.length;
-        entropy -= p * Math.log2(p);
-      }
-      // Define the fallback cost such that a lower cost is better.
-      // Adding 1 ensures that an ideal move (instant win) would have cost 1.
-      // The penalty is proportional to the "missing" entropy compared to the maximum.
-      const fallbackCost = 1 + (maxEntropy - entropy);
-      if (fallbackCost < bestFallbackCost) {
-        bestFallbackCost = fallbackCost;
+      const ent = oneStepEntropy(guess, candidates, feedbackCache);
+      // We'll define fallback cost as 1 + (maxEnt - ent), so lower is better
+      const cost = 1 + (maxEnt - ent);
+      if (cost < bestFallback) {
+        bestFallback = cost;
         bestGuess = guess;
       }
     }
-    return { guess: bestGuess, moves: bestFallbackCost };
+    return { guess: bestGuess, moves: bestFallback };
   }
 
-  // Generate memo key
-  const key = `${depthLeft}:${candidates.join(",")}`;
-  if (memo.has(key)) {
-    return memo.get(key)!;
+  // Check memo
+  const memoKey = `${depthLeft}:${candidates.join(",")}`;
+  if (memo.has(memoKey)) {
+    return memo.get(memoKey)!;
   }
 
-  // Count expansions
+  // Logging expansions
   progress.expansions += 1;
   if (progress.expansions % progress.expansionsLogInterval === 0) {
     console.log(
-      `[INFO] expansions: ${progress.expansions}, depthLeft=${depthLeft}, setSize=${candidates.length}`
+      `[INFO] expansions=${progress.expansions}, depthLeft=${depthLeft}, size=${candidates.length}`
     );
   }
 
-  let bestGuess = "";
-  let bestExpected = Infinity;
+  // Sort guesses by one-step entropy (descending), so best guesses are tried first
+  const guessOrder = candidates.slice();
+  guessOrder.sort(
+    (a, b) =>
+      oneStepEntropy(b, candidates, feedbackCache) -
+      oneStepEntropy(a, candidates, feedbackCache)
+  );
 
-  // Try each candidate as guess
-  for (let i = 0; i < candidates.length; i++) {
-    const guess = candidates[i];
+  if (logCandidates) {
+    console.log(`[INFO] Candidates: ${guessOrder.join(", ")}`);
+  }
 
-    // Partition by feedback
+  let localBestGuess = "";
+  let localBestMoves = Infinity;
+
+  // Explore guesses in order of descending one-step entropy
+  for (const guess of guessOrder) {
+    // Partition the candidate set by feedback
+    const feedbackCounts: Record<string, number> = {};
     const feedbackGroups: Record<string, string[]> = {};
+
     for (const answer of candidates) {
       const fb = feedbackCache[guess][answer];
+      feedbackCounts[fb] = (feedbackCounts[fb] || 0) + 1;
       if (!feedbackGroups[fb]) feedbackGroups[fb] = [];
       feedbackGroups[fb].push(answer);
     }
 
-    // Accumulate expected moves for this guess
-    let expectedMoves = 0;
-    for (const group of Object.values(feedbackGroups)) {
+    // Accumulate expected moves
+    let expectedMoves = 1; // +1 for the current guess
+    for (const [fb, group] of Object.entries(feedbackGroups)) {
       const prob = group.length / candidates.length;
       if (group.length > 1) {
-        const sub = computeOptimalGuessRecursive(
+        const subResult = computeOptimalGuessRecursive(
           group,
           depthLeft - 1,
           feedbackCache,
           memo,
-          progress
-        ).moves;
-        // For expected value, we always multiply by prob
-        if (sub === Infinity) {
-          expectedMoves += prob * Infinity; // => Infinity if prob>0
-        } else {
-          expectedMoves += prob * sub;
-        }
+          progress,
+          false
+        );
+        expectedMoves += prob * subResult.moves;
+      }
+      // Early partial sum check
+      if (expectedMoves >= localBestMoves) {
+        expectedMoves = Infinity;
+        break;
       }
     }
-    // +1 for the current guess
-    expectedMoves += 1;
 
-    // If partial result is already worse than our known best, prune
+    // Prune if we can't beat the global bestSoFar
     if (expectedMoves >= progress.bestSoFar) {
-      // This guess can't beat the best top-level guess we have so far, skip it
       continue;
     }
 
-    // Keep track of the best among these local candidates
-    if (expectedMoves < bestExpected) {
-      bestExpected = expectedMoves;
-      bestGuess = guess;
-      // Additional pruning:
-      // If we find something extremely close to 1.0, we can break early:
-      if (bestExpected <= 1.00001) {
+    if (expectedMoves < localBestMoves) {
+      localBestMoves = expectedMoves;
+      localBestGuess = guess;
+      // If we find a guess near 1.0, no need to continue
+      if (localBestMoves <= 1.00001) {
         break;
       }
     }
   }
 
-  const result: GuessResult = { guess: bestGuess, moves: bestExpected };
-  memo.set(key, result);
+  const result = { guess: localBestGuess, moves: localBestMoves };
+  memo.set(memoKey, result);
 
-  // If we're at the top-level call (depthLeft == MAX_ROUNDS) and this guess is better than
-  // the global bestSoFar, we update the global bestSoFar for subsequent pruning
-  // (Or you can do this conditionally if you only want to track top-level calls.)
-  if (depthLeft === MAX_ROUNDS && bestExpected < progress.bestSoFar) {
-    progress.bestSoFar = bestExpected;
+  // If we're at the top-level, update progress.bestSoFar
+  if (depthLeft === MAX_ROUNDS && localBestMoves < progress.bestSoFar) {
+    progress.bestSoFar = localBestMoves;
   }
 
   return result;
 }
 
-//
-// =========================================
-// 4. Precomputation
-// =========================================
-//
-
 /**
- * Computes the best first guess from the entire candidate corpus.
- * If `useRecursive` is true, we do a full 6-depth search. Otherwise, we pick
- * the word with highest one-step Shannon entropy.
- */
-export async function precomputeBestFirstGuess(useRecursive = false) {
-  const candidateRows = await db.select().from(candidateWords);
-
-  // Single sort of candidate set
-  const candidates = candidateRows.map((row) => row.word).sort();
-
-  const feedbackCache = await buildFeedbackCache();
-
-  let bestFirstGuess = "";
-  if (!useRecursive) {
-    // Use simple one-step entropy
-    console.log("[INFO] Building feedback cache for one-step entropy...");
-
-    let bestEntropy = -Infinity;
-    for (const g of candidates) {
-      let entropy = 0;
-      // Compute entropy
-      const freq: Record<string, number> = {};
-      for (const ans of candidates) {
-        const fb = feedbackCache[g][ans];
-        freq[fb] = (freq[fb] || 0) + 1;
-      }
-      const total = candidates.length;
-      for (const count of Object.values(freq)) {
-        const p = count / total;
-        entropy -= p * Math.log2(p);
-      }
-      if (entropy > bestEntropy) {
-        bestEntropy = entropy;
-        bestFirstGuess = g;
-      }
-    }
-    console.log(
-      `[INFO] Best first guess by entropy: ${bestFirstGuess} (entropy=${bestEntropy.toFixed(
-        3
-      )})`
-    );
-  } else {
-    // Use full recursion with depth=6
-    console.log(
-      `[INFO] Full recursion with depth=6 on ${candidates.length} candidates.`
-    );
-    console.log("[INFO] Building complete feedback cache...");
-
-    const memo = new Map<string, GuessResult>();
-    const progress: ProgressTracker = {
-      expansions: 0,
-      expansionsLogInterval: 1000,
-      bestSoFar: Infinity,
-    };
-    const result = computeOptimalGuessRecursive(
-      candidates,
-      MAX_ROUNDS,
-      feedbackCache,
-      memo,
-      progress
-    );
-    bestFirstGuess = result.guess;
-    console.log(
-      `[INFO] Recursive best first guess: ${bestFirstGuess}, expected moves ~ ${result.moves.toFixed(
-        3
-      )}`
-    );
-    console.log(`[INFO] Total expansions: ${progress.expansions}`);
-  }
-
-  const [record] = await db
-    .insert(round1)
-    .values({ id: 1, bestGuess: bestFirstGuess })
-    .returning();
-  console.log(`[INFO] Stored best first guess in DB: ${bestFirstGuess}`);
-  return record;
-}
-
-/**
- * For each possible feedback pattern from the best first guess, compute the
- * optimal second guess using recursion with depth=5.
+ * Given a 'previousGuess' and a list of valid 'remainingCandidates', we partition the candidates
+ * by their feedback relative to 'previousGuess', then recursively compute the best guess for each partition.
+ *
+ * The results are stored in 'conditionalGuesses' so we can recall them later.
  */
 export async function computeConditionalGuesses(
   previousGuess: string,
   round: number,
   remainingCandidates: string[]
 ) {
+  // Sort the list to have a consistent ordering
   const candidates = remainingCandidates.slice().sort();
+  console.log(
+    `[INFO] Round ${round}: building feedback cache for ${candidates.length} candidates.`
+  );
 
-  console.log(`[INFO] Building feedback cache for second-guess computation...`);
   const feedbackCache = await buildFeedbackCache();
 
-  // Partition all candidates by the feedback they'd produce if the bestFirstGuess were used
+  // Partition candidates by feedback from 'previousGuess'
+  // so we only consider consistent words in each group
   const feedbackGroups: Record<string, string[]> = {};
-  for (const answer of candidates) {
-    const fb = feedbackCache[previousGuess][answer];
-    if (!feedbackGroups[fb]) feedbackGroups[fb] = [];
-    feedbackGroups[fb].push(answer);
+  for (const candidate of candidates) {
+    const fb = feedbackCache[previousGuess][candidate];
+    if (!feedbackGroups[fb]) {
+      feedbackGroups[fb] = [];
+    }
+    feedbackGroups[fb].push(candidate);
   }
 
   const memo = new Map<string, GuessResult>();
-
-  // We'll track expansions as well
   const progress: ProgressTracker = {
     expansions: 0,
-    expansionsLogInterval: 500,
+    expansionsLogInterval: 5000,
     bestSoFar: Infinity,
   };
 
-  // For each feedback, run recursion with depth=5
+  // For each unique feedback pattern, compute best next guess with depth=MAX_ROUNDS - (round-1).
+  // E.g., if round=2, we have 5 guesses left.
+  const depthLeft = MAX_ROUNDS - (round - 1);
+
   for (const [fb, group] of Object.entries(feedbackGroups)) {
     if (group.length <= 1) {
-      // If only one or zero candidates remain, that guess is trivially correct.
+      // If there's only 0 or 1 candidate, the best guess is trivially known
       const bestSecond = group[0] || previousGuess;
       console.log(
-        `[INFO] Feedback ${fb}: only one candidate, so bestSecond=${bestSecond}`
+        `[INFO] Feedback ${fb}: only one candidate => best guess=${bestSecond}`
       );
       await db.insert(conditionalGuesses).values({
-        round,
+        currentRound: round,
         previousGuess,
         feedback: fb,
         bestGuess: bestSecond,
         expectedMoves: 0,
-        allPossibilities: group.join(","),
+        candidateWords: group.join(","),
       });
       continue;
     }
     console.log(
-      `[INFO] Computing second guess for feedback ${fb} (group size=${group.length})...`
+      `[INFO] Round ${round}, feedback=${fb}, group size=${group.length}`
     );
+
+    // Recurse
     const result = computeOptimalGuessRecursive(
       group,
-      MAX_ROUNDS - 1,
+      depthLeft,
       feedbackCache,
       memo,
       progress
     );
     console.log(
-      `[INFO] -> best second guess: ${
+      `[INFO] => best guess=${
         result.guess
-      }, expected moves=${result.moves.toFixed(3)} (expansions so far: ${
+      } (expected moves=${result.moves.toFixed(3)}), expansions so far=${
         progress.expansions
-      })`
+      }`
     );
+
     await db.insert(conditionalGuesses).values({
-      round,
+      currentRound: round,
       previousGuess,
       feedback: fb,
       bestGuess: result.guess,
       expectedMoves: result.moves,
-      allPossibilities: candidates.join(","),
+      candidateWords: group.join(","),
     });
   }
 }
 
+/* --------------------------------------
+   6. Runner
+-------------------------------------- */
+
+/**
+ * Runs precomputation for every candidate as if it were the "previous guess".
+ * This will populate 'conditionalGuesses' for round=2.
+ * You could adapt this to handle deeper rounds if needed.
+ */
 export async function runPrecomputation() {
   const allCandidates = await db.query.candidateWords.findMany({
     orderBy: [asc(candidateWords.word)],
   });
   const allWords = allCandidates.map((row) => row.word);
+
+  console.log(`[INFO] Starting runPrecomputation on ${allWords.length} words.`);
+
+  // For each word in the corpus, treat it as if it were the previous guess
+  // and compute the best next guess for the next round
   for (const word of allWords) {
-    console.log(`[INFO] Computing conditional guesses for ${word}...`);
-    const remainingCandidates = allWords.filter((w) => w !== word);
-    await computeConditionalGuesses(word, 2, remainingCandidates);
+    console.log(
+      `[INFO] Computing conditional guesses for previous guess='${word}'...`
+    );
+    const remaining = allWords.filter((w) => w !== word);
+    await computeConditionalGuesses(word, 2, remaining);
   }
+
+  console.log("[INFO] runPrecomputation complete!");
 }
