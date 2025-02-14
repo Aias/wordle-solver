@@ -1,6 +1,6 @@
 import { db } from "./db";
-import { candidateWords, bestGuesses } from "./schema";
-import { and, asc, eq } from "drizzle-orm";
+import { bestGuesses } from "./schema";
+import { and, eq } from "drizzle-orm";
 import { createHash } from "crypto";
 import { sql } from "drizzle-orm";
 
@@ -375,14 +375,6 @@ async function computeOptimalGuessRecursive(
     storeFeedback
   );
 
-  // If no finite solution found, warn
-  if (localBest.expectedMoves === Infinity) {
-    console.warn(
-      `Warning: No finite solution for ${
-        candidateIndices.length
-      } candidates; fallback guess=${words[localBest.bestGuess]}`
-    );
-  }
   return localBest;
 }
 
@@ -392,24 +384,24 @@ async function computeOptimalGuessRecursive(
 
 /**
  * Main routine for precomputing round‑2 best guesses.
- * Assumes a round‑1 best guess of "TRACE" (or whatever is in the DB for round=1).
+ * Now handles multiple round‑1 starting words, including non-candidate words.
  */
 export async function runPrecomputation() {
-  // Retrieve round‑1 row from the DB.
-  const round1Row = await db.query.bestGuesses.findFirst({
+  // Retrieve all round‑1 rows from the DB.
+  const round1Rows = await db.query.bestGuesses.findMany({
     where: (table, { eq }) => eq(table.round, 1),
   });
-  if (!round1Row || !round1Row.bestGuess) {
+  if (!round1Rows || round1Rows.length === 0) {
     console.error(
-      "[ERROR] Round=1 row not found or missing bestGuess. Insert one first (e.g. bestGuess='TRACE')."
+      "[ERROR] No round=1 rows found. Insert starting words first."
     );
     return;
   }
-  const firstGuess = round1Row.bestGuess;
-  console.log(`[INFO] Found round=1 row. bestGuess=${firstGuess}`);
+  console.log(`[INFO] Found ${round1Rows.length} round=1 starting words.`);
 
-  // Parse full candidate set from round‑1.
-  const candidateWordsStr = round1Row.candidateWords;
+  // Parse full candidate set from first round‑1 row
+  // (they should all have the same candidate set)
+  const candidateWordsStr = round1Rows[0].candidateWords;
   const candidateWordsArr = candidateWordsStr
     .split(",")
     .map((w) => w.trim())
@@ -425,51 +417,62 @@ export async function runPrecomputation() {
   feedbackMatrix = buildFeedbackMatrix(words);
   console.log("[INFO] Feedback matrix built.");
 
-  // Partition candidates by feedback from the first guess, e.g. "TRACE".
-  const firstGuessIdx = wordToIndex.get(firstGuess);
-  if (firstGuessIdx === undefined) {
-    console.error(
-      `[ERROR] First guess "${firstGuess}" not found in candidate set.`
-    );
-    return;
-  }
-  const feedbackGroups = new Map<number, number[]>();
-  for (let idx = 0; idx < N; idx++) {
-    const fbCode = feedbackMatrix[firstGuessIdx * N + idx];
-    if (!feedbackGroups.has(fbCode)) {
-      feedbackGroups.set(fbCode, []);
+  // Process each starting word
+  for (const round1Row of round1Rows) {
+    const firstGuess = round1Row.bestGuess;
+    if (!firstGuess) {
+      console.error("[ERROR] Found round=1 row missing bestGuess, skipping.");
+      continue;
     }
-    feedbackGroups.get(fbCode)!.push(idx);
+    console.log(`\n[INFO] Processing starting word: ${firstGuess}`);
+
+    // For non-candidate starting words, we need to compute feedback directly
+    const feedbackGroups = new Map<number, number[]>();
+    for (let idx = 0; idx < N; idx++) {
+      // If the first guess is in our candidate set, use the matrix
+      // Otherwise, compute the feedback directly
+      const fbCode = wordToIndex.has(firstGuess)
+        ? feedbackMatrix[wordToIndex.get(firstGuess)! * N + idx]
+        : getFeedbackCode(firstGuess, words[idx]);
+
+      if (!feedbackGroups.has(fbCode)) {
+        feedbackGroups.set(fbCode, []);
+      }
+      feedbackGroups.get(fbCode)!.push(idx);
+    }
+
+    // Compute best guess for round=2 in each feedback partition
+    const depthLeft = MAX_ROUNDS - 1;
+
+    for (const [fbCode, group] of feedbackGroups.entries()) {
+      const groupSorted = group.slice().sort((a, b) => a - b);
+      console.log(
+        `[INFO] ${firstGuess}, feedback=${feedbackToString(
+          fbCode
+        )}, possible next guesses=${
+          groupSorted.length
+        }. Computing optimal guess...`
+      );
+
+      const result = await computeOptimalGuessRecursive(
+        groupSorted,
+        depthLeft,
+        Infinity,
+        firstGuess,
+        feedbackToString(fbCode)
+      );
+
+      console.log(
+        `[INFO] ${firstGuess}, feedback=${feedbackToString(
+          fbCode
+        )} => best guess=${
+          words[result.bestGuess]
+        } (expected guesses=${result.expectedMoves.toFixed(3)})`
+      );
+    }
   }
 
-  // Now compute the best guess for round=2 in each feedback partition.
-  // round=2 => depthLeft=5 (since 6 guesses max, we used 1 guess already).
-  const depthLeft = MAX_ROUNDS - 1;
-
-  for (const [fbCode, group] of feedbackGroups.entries()) {
-    const groupSorted = group.slice().sort((a, b) => a - b);
-    // For logging
-    console.log(
-      `[INFO] Round=2, feedback=${feedbackToString(fbCode)}, group size=${
-        groupSorted.length
-      }. Computing optimal guess...`
-    );
-
-    // Compute best guess for this subset with recursion.
-    const result = await computeOptimalGuessRecursive(
-      groupSorted,
-      depthLeft,
-      Infinity,
-      firstGuess,
-      feedbackToString(fbCode)
-    );
-
-    console.log(
-      `[INFO] Feedback=${feedbackToString(fbCode)} => best guess=${
-        words[result.bestGuess]
-      } (expected moves=${result.expectedMoves.toFixed(3)})`
-    );
-  }
-
-  console.log("[INFO] Precomputation for round 2 complete!");
+  console.log(
+    "\n[INFO] Precomputation for round 2 complete for all starting words!"
+  );
 }

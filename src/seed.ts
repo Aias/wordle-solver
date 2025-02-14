@@ -1,6 +1,14 @@
 import { db } from "./db";
 import { candidateWords, bestGuesses } from "./schema";
 
+const STARTING_WORDS = [
+  "TRACE", // https://jonathanolson.net/experiments/optimal-wordle-solutions
+  "SALET",
+  "ROATE", // https://medium.com/@tglaiel/the-mathematically-optimal-first-guess-in-wordle-cbcb03c19b0a
+  "RAISE",
+  "SOARE",
+];
+
 (async () => {
   await db.delete(candidateWords);
   await db.delete(bestGuesses);
@@ -16,12 +24,14 @@ import { candidateWords, bestGuesses } from "./schema";
     console.log(`Inserted ${word}`);
   }
 
-  await db.insert(bestGuesses).values({
-    round: 1,
-    previousGuess: null,
-    feedback: null,
-    bestGuess: "TRACE",
-    expectedMoves: 6,
-    candidateWords: wordArray.join(","),
-  });
+  await db.insert(bestGuesses).values(
+    STARTING_WORDS.map((word) => ({
+      round: 1,
+      previousGuess: null,
+      feedback: null,
+      bestGuess: word,
+      expectedMoves: 3.5, // All of these are somewhere between 3 and 4, see links above.
+      candidateWords: wordArray.join(","),
+    }))
+  );
 })();
